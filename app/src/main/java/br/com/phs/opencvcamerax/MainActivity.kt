@@ -11,13 +11,20 @@ import android.os.Build
 import android.os.Bundle
 import android.provider.MediaStore
 import android.util.Log
+import android.view.View
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import br.com.phs.opencvcamerax.databinding.ActivityMainBinding
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import org.opencv.android.BaseLoaderCallback
 import org.opencv.android.LoaderCallbackInterface
 import org.opencv.android.OpenCVLoader
@@ -46,6 +53,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var cameraExecutor: ExecutorService
     private lateinit var converter: YuvToRgbConverter
     private var net: Net? = null
+    private var busy = false
 
     private val classNames = arrayOf(
         "background", "aeroplane", "bicycle", "bird", "boat", "bottle", "bus", "car", "cat",
@@ -74,22 +82,46 @@ class MainActivity : AppCompatActivity() {
         setContentView(viewBinding.root)
 
         this.viewBinding.viewFinder.setOnClickListener {
+
+            if (busy) return@setOnClickListener
+
+            this.viewBinding.imageProcessProgressBar.visibility = View.VISIBLE
             this.takeImageAnalyzer()
-            //this.takePhoto()
-            //this.takePhotoImage()
+            //this.takePictureAndSave()
+            //this.takePicture()
+        }
+
+        this.viewBinding.posProcessImgCloseBtn.setOnClickListener {
+            this.viewBinding.posProcessImg.visibility = View.GONE
+            this.viewBinding.posProcessImgCloseBtn.visibility = View.GONE
+            runBlocking {
+                withContext(Dispatchers.IO) {
+                    Thread.sleep(200)
+                    startCamera()
+                }
+            }
         }
 
         cameraExecutor = Executors.newSingleThreadExecutor()
 
-        initConverter()
+        this.hideSystemBars()
+        this.initConverter()
 
+    }
+
+    private fun hideSystemBars() {
+        val windowInsetsController = ViewCompat.getWindowInsetsController(window.decorView) ?: return
+        // Configure the behavior of the hidden system bars
+        windowInsetsController.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        // Hide both the status bar and the navigation bar
+        windowInsetsController.hide(WindowInsetsCompat.Type.systemBars())
     }
 
     private fun initConverter() {
         converter = YuvToRgbConverter(this)
     }
 
-    fun onCameraViewStarted(width: Int, height: Int) {
+    private fun onCameraViewStarted() {
 
         val proto: String = getPath("MobileNetSSD_deploy.prototxt", this)
         val weights: String = getPath("MobileNetSSD_deploy.caffemodel", this)
@@ -98,7 +130,7 @@ class MainActivity : AppCompatActivity() {
 
     }
 
-    private fun takePhoto() {
+    private fun takePictureAndSave() {
 
         // Get a stable reference of the modifiable image capture use case
         val imageCapture = imageCapture ?: return
@@ -146,6 +178,7 @@ class MainActivity : AppCompatActivity() {
 
         imageAnalyzer?.setAnalyzer(cameraExecutor) { image ->
 
+            this.busy = true
             var rotatedBitmapImage: Bitmap? = null
             var rgba: Mat? = null
 
@@ -161,23 +194,30 @@ class MainActivity : AppCompatActivity() {
 
             }
 
-            onCameraViewStarted(image.width, image.height)
-            val list = processImage(rgba)
-            drawRectangles(rotatedBitmapImage, list)
-
             imageAnalyzer?.clearAnalyzer()
             image.close()
-            startCamera()
+
+            this.onCameraViewStarted()
+            val list = this.processImage(rgba)
+
+            if (list.isNotEmpty()) {
+                this.drawRectangles(rotatedBitmapImage, list)
+            } else {
+                runOnUiThread {
+                    this.viewBinding.imageProcessProgressBar.visibility = View.GONE
+                }
+                this.startCamera()
+            }
 
         }
 
     }
 
-    private fun processImage(frame: Mat?): List<RectF> {
+    private fun processImage(frame: Mat?): List<Pair<String, RectF>> {
 
         frame?: return emptyList()
 
-        val rectList = mutableListOf<RectF>()
+        val rectList = mutableListOf<Pair<String, RectF>>()
 
         val inWidth = 300
         val inHeight = 300
@@ -212,7 +252,6 @@ class MainActivity : AppCompatActivity() {
                 val bottom = (detections[i, 6][0] * rows)
 
                 val rect = RectF(left.toFloat(), top.toFloat(), right.toFloat(), bottom.toFloat())
-                rectList.add(rect)
 
                 // Draw rectangle around detected object.
                 Imgproc.rectangle(
@@ -223,6 +262,7 @@ class MainActivity : AppCompatActivity() {
                 if (classId >= 0 && classId < classNames.size) {
 
                     val label = classNames[classId] + ": " + confidence
+                    rectList.add(Pair(label, rect))
                     Log.i("Detected: ", label)
                     val baseLine = IntArray(1)
                     val labelSize: Size =
@@ -248,24 +288,44 @@ class MainActivity : AppCompatActivity() {
 
     }
 
-    private fun drawRectangles(bt: Bitmap?, list: List<RectF>) {
+    private fun drawRectangles(bt: Bitmap?, list: List<Pair<String, RectF>>) {
 
         bt?: return
+
+        val scale = resources.displayMetrics.density
 
         val tempBitmap = Bitmap.createScaledBitmap(bt, bt.width, bt.height, true)
         val canvas = Canvas(tempBitmap)
         val p = Paint()
-        p.style = Paint.Style.FILL
+        p.style = Paint.Style.STROKE
+        p.strokeWidth = 2f
         p.isAntiAlias = true
         p.isFilterBitmap = true
         p.isDither = true
         p.color = Color.RED
+        // Text
+        val textPaint = Paint()
+        textPaint.style = Paint.Style.FILL_AND_STROKE
+        textPaint.color = Color.RED
+        textPaint.textSize = (6 * scale)
 
         list.forEach { rect ->
-            canvas.drawRect(rect, p)
+
+            // Draw Rectangle
+            canvas.drawRect(rect.second, p)
+            // Draw Label
+            val bounds = Rect()
+            textPaint.getTextBounds(rect.first, 0, rect.first.length, bounds)
+            canvas.drawText(rect.first, rect.second.left, rect.second.top, textPaint)
+
         }
 
-        if (tempBitmap != null) {}
+        runOnUiThread {
+            this.viewBinding.posProcessImg.visibility = View.VISIBLE
+            this.viewBinding.posProcessImgCloseBtn.visibility = View.VISIBLE
+            this.viewBinding.posProcessImg.setImageBitmap(tempBitmap)
+            this.viewBinding.imageProcessProgressBar.visibility = View.GONE
+        }
 
     }
 
@@ -298,7 +358,7 @@ class MainActivity : AppCompatActivity() {
 
     }
 
-    private fun takePhotoImage() {
+    private fun takePicture() {
 
         imageCapture?.takePicture(cameraExecutor, object : ImageCapture.OnImageCapturedCallback() {
 
@@ -315,7 +375,7 @@ class MainActivity : AppCompatActivity() {
 
                 override fun onError(exception: ImageCaptureException) {
                     super.onError(exception)
-                    Log.e("takePhotoImage", exception.message?: "UNKNOWN")
+                    Log.e("takePicture", exception.message?: "UNKNOWN")
                 }
 
             }
@@ -362,6 +422,7 @@ class MainActivity : AppCompatActivity() {
             val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
 
             try {
+
                 // Unbind use cases before rebinding
                 cameraProvider.unbindAll()
 
@@ -374,6 +435,8 @@ class MainActivity : AppCompatActivity() {
             }
 
         }, ContextCompat.getMainExecutor(this))
+
+        this.busy = false
 
     }
 
